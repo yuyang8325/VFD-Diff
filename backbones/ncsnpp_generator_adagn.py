@@ -270,7 +270,7 @@ class NCSNpp(nn.Module):
   def forward(self, x, time_cond, z, return_features=False):
     # timestep/noise_level embedding; only for continuous training
     zemb = self.z_transform(z)
-    feats = [] if return_features else None   # VFD-Diff: 各尺度ResNet块输出特征(公式9特征蒸馏用)
+    feats = [] if return_features else None   # VFD-Diff: per-scale ResNet-block output features (for Eq. 9 feature distillation)
     modules = self.all_modules
     m_idx = 0
     if self.embedding_type == 'fourier':
@@ -318,7 +318,7 @@ class NCSNpp(nn.Module):
 
         hs.append(h)
       if feats is not None:
-        feats.append(h)   # 该尺度最后一个ResNet块的输出
+        feats.append(h)   # output of the last ResNet block at this scale
 
       if i_level != self.num_resolutions - 1:
         if self.resblock_type == 'ddpm':
@@ -352,7 +352,7 @@ class NCSNpp(nn.Module):
     h = modules[m_idx](h, temb, zemb)
     m_idx += 1
     if feats is not None:
-      feats.append(h)   # bottleneck(中间ResNet块)输出
+      feats.append(h)   # output of the bottleneck (middle ResNet blocks)
 
     pyramid = None
 
