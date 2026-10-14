@@ -24,7 +24,6 @@ try:
         ],
     )
 except Exception:
-    # 无 CUDA 工具链时编译失败,回退到下方的纯 PyTorch 实现
     upfirdn2d_op = None
 
 
