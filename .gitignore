@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 训练产物 / Training artifacts
+*.pth
+*.npy
+*.mat
+*.log
+nohup.out
+ffa_results/
+
+# VFD-Diff 血管掩码缓存(由训练自动生成)/ vessel-mask cache
+tranA_vmasks/
+
+# 数据集不入库 / datasets are not shipped
+tranA/
+tranB/
+
+# 编辑器 / IDE
+.zcode/
+.idea/
+.vscode/

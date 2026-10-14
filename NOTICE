@@ -1,0 +1,15 @@
+VFD-Diff
+Copyright 2026 The VFD-Diff authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product is a derivative work of SynDiff
+(https://github.com/icon-lab/SynDiff), Copyright (c) 2022 ICON Lab,
+licensed under the MIT License. The MIT notice is reproduced in the
+"THIRD-PARTY CODE NOTICES" appendix of the LICENSE file.
+
+This product includes StyleGAN2 operator code from
+https://github.com/rosinality/stylegan2-pytorch (MIT License, see
+utils/op/LICENSE_MIT) and code originating from score_sde_pytorch
+(Apache License 2.0) and Denoising Diffusion GAN (NVIDIA Source Code
+License). See the per-file copyright headers for details.
