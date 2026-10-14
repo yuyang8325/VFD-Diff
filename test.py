@@ -12,8 +12,8 @@ import torchvision.transforms as transforms
 def psnr(img1, img2):
     #Peak Signal to Noise Ratio
     mse = torch.mean((img1 - img2) ** 2)
-    max_val = img1.max() if img1.max() != 0 else 1e-6  # 避免除零
-    return 20 * torch.log10(max_val / torch.sqrt(mse + 1e-8))  # 避免sqrt(0)
+    max_val = img1.max() if img1.max() != 0 else 1e-6  # avoid division by zero
+    return 20 * torch.log10(max_val / torch.sqrt(mse + 1e-8))  # avoid sqrt(0)
         
 #%% Diffusion coefficients 
 def var_func_vp(t, beta_min, beta_max):
@@ -38,14 +38,14 @@ def get_time_schedule(args, device):
     t = torch.from_numpy(t).to(device) * (1. - eps_small)  + eps_small
     return t
 
-# ===================== 全GPU张量，彻底解决设备不匹配 =====================
+# ===================== All tensors on GPU: fully resolves device mismatches =====================
 def get_sigma_schedule(args, device):
     n_timestep = args.num_timesteps
     beta_min = args.beta_min
     beta_max = args.beta_max
     eps_small = 1e-3
    
-    # 所有张量直接在GPU创建，一步到位，无迁移
+    # All tensors are created directly on the GPU in one step, with no transfers
     t = np.arange(0, n_timestep + 1, dtype=np.float64)
     t = t / n_timestep
     t = torch.from_numpy(t).to(device) * (1. - eps_small) + eps_small
@@ -57,7 +57,7 @@ def get_sigma_schedule(args, device):
     alpha_bars = 1.0 - var
     betas = 1 - alpha_bars[1:] / alpha_bars[:-1]
     
-    # 核心修复：first张量直接在GPU创建，和betas同设备
+    # Key fix: the first tensor is created directly on the GPU, on the same device as betas
     first = torch.tensor([1e-8], dtype=torch.float32, device=device)
     betas = torch.cat((first, betas))
     betas = betas.type(torch.float32)
@@ -76,7 +76,7 @@ class Posterior_Coefficients():
         
         self.alphas = 1 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, 0)
-        # 全GPU张量，无CPU张量
+        # All tensors on GPU, no CPU tensors
         self.alphas_cumprod_prev = torch.cat(
                                     (torch.tensor([1.], dtype=torch.float32, device=device), self.alphas_cumprod[:-1]), 0
                                         )               
@@ -131,16 +131,16 @@ def sample_from_model(coefficients, generator, n_time, x_init, T, opt):
         
     return x
 
-# ===================== 完美版权重加载函数 =====================
+# ===================== Robust checkpoint loading =====================
 def load_checkpoint(checkpoint_dir, netG, name_of_network, epoch, device = 'cuda:0'):
     checkpoint_file = checkpoint_dir.format(name_of_network, epoch)  
-    print(f"📌 正在加载权重文件: {checkpoint_file}")
+    print(f"Loading checkpoint file: {checkpoint_file}")
 
-    # 加载权重文件（先CPU，避免GPU冲突）
+    # Load the checkpoint on CPU first to avoid GPU conflicts
     checkpoint = torch.load(checkpoint_file, map_location="cpu")
     ckpt = checkpoint
 
-    # 仅移除module.前缀（如果存在），无任何多余操作
+    # Only strip the module. prefix (if present), nothing else
     temp_ckpt = {}
     for key in list(ckpt.keys()):
         if key.startswith('module.'):
@@ -149,14 +149,14 @@ def load_checkpoint(checkpoint_dir, netG, name_of_network, epoch, device = 'cuda
             temp_ckpt[key] = ckpt[key]
     ckpt = temp_ckpt
 
-    # 加载权重
+    # Load the weights
     try:
         netG.load_state_dict(ckpt, strict=True)
-        print(f"✅ 成功加载{name_of_network}权重（键名完全匹配）")
+        print(f"Successfully loaded {name_of_network} weights (exact key match)")
     except RuntimeError as e:
-        print(f"⚠️ 严格匹配失败，容错加载：{str(e)[:200]}...")
+        print(f"Strict match failed, falling back to lenient loading: {str(e)[:200]}...")
         netG.load_state_dict(ckpt, strict=False)
-        print(f"✅ 成功加载{name_of_network}权重（容错模式）")
+        print(f"Successfully loaded {name_of_network} weights (lenient mode)")
     
     netG = netG.to(device)
     netG.eval()
@@ -165,15 +165,15 @@ def load_checkpoint(checkpoint_dir, netG, name_of_network, epoch, device = 'cuda
 #%%
 def sample_and_test(args):
     torch.manual_seed(42)
-    # GPU设备配置，无任何冲突
+    # GPU device configuration, conflict-free
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu_chose)
         device = torch.device(f'cuda:{args.gpu_chose}')
         torch.cuda.empty_cache()
-        print(f"🖥️ 使用GPU: cuda:{args.gpu_chose}")
+        print(f"Using GPU: cuda:{args.gpu_chose}")
     else:
         device = torch.device('cpu')
-        print("⚠️ CUDA不可用，使用CPU推理")
+        print("Warning: CUDA unavailable, running inference on CPU")
     
     epoch_chosen = args.which_epoch
     
@@ -208,15 +208,16 @@ def sample_and_test(args):
     
     loss1 = np.zeros((1,len(data_loader)))
     loss2 = np.zeros((1,len(data_loader)))
-    # 图像不做裁剪，PSNR在完整image_size上计算；数组形状与图像尺寸一致
+    # Images are not cropped; PSNR is computed on the full image_size,
+    # and array shapes match the image size
     syn_im1=np.zeros((args.image_size, args.image_size, len(data_loader)))
     syn_im2=np.zeros((args.image_size, args.image_size, len(data_loader)))
     
-    # VFD-Diff FDE(公式8): 生成端低频抑制参数
+    # VFD-Diff FDE (Eq. 8): generation-side low-frequency suppression parameters
     use_fde = not args.no_fde
 
-    # 测试第一个模型
-    print("\n=== 开始测试gen_diffusive_1 (tranA生成) ===")
+    # Test the first model
+    print("\n=== Testing gen_diffusive_1 (tranA generation) ===")
     for iteration, (x , y) in enumerate(data_loader): 
         real_data = x.to(device, non_blocking=True)
         source_data = y.to(device, non_blocking=True)
@@ -239,8 +240,8 @@ def sample_and_test(args):
         fake_sample1 = torch.cat((source_data, fake_sample1, real_data),axis=-1)
         torchvision.utils.save_image(fake_sample1, '{}/{}_samples1_{}.jpg'.format(save_dir, phase, iteration), normalize=True)
 
-    # 测试第二个模型
-    print("\n=== 开始测试gen_diffusive_2 (tranB生成) ===")
+    # Test the second model
+    print("\n=== Testing gen_diffusive_2 (tranB generation) ===")
     for iteration, (x , y) in enumerate(data_loader):
         real_data = y.to(device, non_blocking=True)
         source_data = x.to(device, non_blocking=True)
@@ -249,7 +250,8 @@ def sample_and_test(args):
         fake_sample2 = sample_from_model(pos_coeff, gen_diffusive_2, args.num_timesteps, x2_t, T, args)
 
         fake_sample2 = to_range_0_1(fake_sample2)
-        # VFD-Diff FDE(公式8): 目标方向(tranA→tranB)生成图经傅里叶低频抑制
+        # VFD-Diff FDE (Eq. 8): Fourier low-frequency suppression on generated
+        # images in the target direction (tranA->tranB)
         if use_fde:
             fake_sample2 = fourier_low_freq_suppress(fake_sample2, args.vfd_beta_d, args.vfd_cutoff)
         fake_sample2 = fake_sample2/(fake_sample2.max() + 1e-8)
@@ -266,21 +268,21 @@ def sample_and_test(args):
         fake_sample2 = torch.cat((source_data, fake_sample2, real_data),axis=-1)
         torchvision.utils.save_image(fake_sample2, '{}/{}_samples2_{}.jpg'.format(save_dir, phase, iteration), normalize=True)
 
-    # 输出最终结果
+    # Print the final results
     psnr1_mean = np.nanmean(loss1)
     psnr2_mean = np.nanmean(loss2)
-    print(f"\n===== 测试完成 =====")
-    print(f"tranA 平均PSNR: {psnr1_mean:.2f} dB")
-    print(f"tranB 平均PSNR: {psnr2_mean:.2f} dB")
+    print(f"\n===== Testing finished =====")
+    print(f"Mean PSNR ({args.contrast1}): {psnr1_mean:.2f} dB")
+    print(f"Mean PSNR ({args.contrast2}): {psnr2_mean:.2f} dB")
 
-    # 保存结果
+    # Save the results
     np.save('{}/psnr_values1.npy'.format(save_dir), loss1)
     np.save('{}/psnr_values2.npy'.format(save_dir), loss2)
 
     with h5py.File(save_dir + '/im_syn.mat',  "w") as f:
         f.create_dataset('images_'+args.contrast1+'syn', data=syn_im1)
         f.create_dataset('images_'+args.contrast2+'syn', data=syn_im2)
-    print(f"📁 结果已保存至: {save_dir}")
+    print(f"Results saved to: {save_dir}")
             
 
 if __name__ == '__main__':
@@ -305,7 +307,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_res_blocks', type=int, default=2,
                         help='number of resnet blocks per scale')
     parser.add_argument('--attn_resolutions', nargs='+', type=int, default=(64, 32, 16),
-                        help='resolution of applying attention(须与训练一致)')
+                        help='resolution of applying attention (must match training)')
     parser.add_argument('--dropout', type=float, default=0.,
                             help='drop-out rate')
     parser.add_argument('--resamp_with_conv', action='store_false', default=True,
@@ -361,17 +363,17 @@ if __name__ == '__main__':
     parser.add_argument('--which_epoch', type=int, default=600)
     parser.add_argument('--gpu_chose', type=int, default=0)
 
-    # VFD-Diff FDE(公式8)测试参数
+    # VFD-Diff FDE (Eq. 8) test parameters
     parser.add_argument('--vfd_beta_d', type=float, default=0.1,
-                        help='公式(8)低频衰减系数β_d(与训练一致)')
+                        help='low-frequency decay coefficient beta_d in Eq. (8) (must match training)')
     parser.add_argument('--vfd_cutoff', type=int, default=32,
-                        help='公式(8)低频掩码半径(像素,与训练一致)')
+                        help='low-frequency mask radius in Eq. (8) (pixels, must match training)')
     parser.add_argument('--no_fde', action='store_true', default=False,
-                        help='关闭生成端低频抑制(基线/消融测试用)')
+                        help='disable generation-side low-frequency suppression (for baseline/ablation tests)')
     args = parser.parse_args()
     
-    # 校验必要参数
+    # Validate required arguments
     if not args.input_path or not args.output_path:
-        raise ValueError("❌ 必须指定 --input_path 和 --output_path 参数！")
+        raise ValueError("Error: --input_path and --output_path must be specified!")
     
     sample_and_test(args)
