@@ -13,29 +13,30 @@ from PIL import Image, ImageDraw, ImageFont
 import shutil
 from skimage.metrics import peak_signal_noise_ratio as psnr
 
-# VFD-Diff 核心模块(论文公式1-9)
+# VFD-Diff core modules (paper Eqs. 1-9)
 from backbones.vfd_modules import (
     adaptive_frangi_mask, hf_enhanced_noise_like, fourier_low_freq_suppress,
     masked_l1_loss, masked_ssim_loss, feature_distill_loss, mask_weighted_source,
 )
 
-# 复制文件工具函数
+# Utility for copying files
 def copy_source(file, output_dir):
     shutil.copyfile(file, os.path.join(output_dir, os.path.basename(file)))
 
-#%% 自定义数据集类（修改：返回图片文件名 + VFD-Diff血管掩码）
+#%% Custom dataset class (modified: also returns image filenames + VFD-Diff vessel masks)
 class CustomFFADataset(Dataset):
     def __init__(self, root_path, phase="train", contrast1="tranA", contrast2="tranB", transform=None,
                  compute_mask=True, frangi_dmax=16.0, frangi_dmin=2.0):
         """
-        加载tranA/tranB数据集（自动发现分类文件夹，适配X_Y.png ↔ X_mask_Y.png命名规则）
-        :param root_path: 根路径（包含tranA/tranB的文件夹）
+        Load the tranA/tranB dataset (auto-discovers class folders, follows the
+        X_Y.png <-> X_mask_Y.png naming convention)
+        :param root_path: root path (folder containing tranA/tranB)
         :param phase: train/val
-        :param contrast1: 源模态文件夹名（tranA：眼底光学影像）
-        :param contrast2: 目标模态文件夹名（tranB：眼底荧光造影图像）
-        :param transform: 图像变换
-        :param compute_mask: 是否计算VFD-Diff血管掩码M_VSA(论文公式1-4,带磁盘缓存)
-        :param frangi_dmax/frangi_dmin: 公式(2)(4)中的最大/最小血管直径(像素,512基准)
+        :param contrast1: source modality folder name (tranA: color fundus photography)
+        :param contrast2: target modality folder name (tranB: fluorescein angiography)
+        :param transform: image transforms
+        :param compute_mask: whether to compute the VFD-Diff vessel mask M_VSA (paper Eqs. 1-4, with disk cache)
+        :param frangi_dmax/frangi_dmin: max/min vessel diameter in Eqs. (2)(4) (pixels, 512-based)
         """
         self.root_path = root_path
         self.phase = phase
@@ -45,26 +46,26 @@ class CustomFFADataset(Dataset):
         self.compute_mask = compute_mask
         self.frangi_dmax = frangi_dmax
         self.frangi_dmin = frangi_dmin
-        # 血管掩码缓存目录: <root>/<contrast1>_vmasks/<phase>/...(与图片同名.png)
+        # Vessel-mask cache dir: <root>/<contrast1>_vmasks/<phase>/... (same name as the image, .png)
         self.mask_root = os.path.join(root_path, contrast1 + '_vmasks', phase)
 
-        # 收集所有匹配的图片对（现在包含文件名）
+        # Collect all matched image pairs (now including filenames)
         self.image_pairs = self._collect_image_pairs()
 
     def _default_transform(self):
-        """默认变换：适配512×512单通道眼底图像"""
+        """Default transform: tailored for 512x512 single-channel fundus images"""
         return transforms.Compose([
             transforms.Grayscale(num_output_channels=1),
             transforms.Resize((512, 512)),
             transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))  # 归一化到[-1,1]
+            transforms.Normalize((0.5,), (0.5,))  # normalize to [-1, 1]
         ])
 
     def _get_tranB_filename(self, tranA_filename):
         """
-        核心辅助函数：将tranA的文件名转换为tranB的对应文件名
-        规则：tranA的`1_1.png` → tranB的`1_mask_1.png`
-              tranA的`5_10.png` → tranB的`5_mask_10.png`
+        Core helper: convert a tranA filename to its tranB counterpart
+        Rule: tranA `1_1.png` -> tranB `1_mask_1.png`
+              tranA `5_10.png` -> tranB `5_mask_10.png`
         """
         name, ext = os.path.splitext(tranA_filename)
         name_parts = name.split('_')
@@ -74,39 +75,39 @@ class CustomFFADataset(Dataset):
             tranB_name = '_'.join(tranB_name_parts)
         else:
             tranB_name = name
-            print(f"警告：tranA文件名 {tranA_filename} 不符合'前缀_序号'格式")
+            print(f"Warning: tranA filename {tranA_filename} does not follow the 'prefix_index' convention")
         
         return tranB_name + ext
 
     def _collect_image_pairs(self):
         """
-        遍历文件夹收集图片对：
-        - train：自动发现分类子文件夹 + 名称转换规则匹配
-        - val：直接根目录 + 名称转换规则匹配
-        返回：列表的元组 (c1_path, c2_path, c1_filename)
+        Traverse folders to collect image pairs:
+        - train: auto-discover class subfolders + name-convention matching
+        - val: directly in the root folder + name-convention matching
+        Returns: a list of tuples (c1_path, c2_path, c1_filename)
         """
         image_pairs = []
         contrast1_root = os.path.join(self.root_path, self.contrast1, self.phase)
         contrast2_root = os.path.join(self.root_path, self.contrast2, self.phase)
         
         if not os.path.exists(contrast1_root) or not os.path.exists(contrast2_root):
-            raise ValueError(f"路径不存在：{contrast1_root} 或 {contrast2_root}")
+            raise ValueError(f"Path does not exist: {contrast1_root} or {contrast2_root}")
         
         if self.phase == "train":
             class_folders = [d for d in os.listdir(contrast1_root) 
                              if os.path.isdir(os.path.join(contrast1_root, d))]
             
             if not class_folders:
-                print(f"警告：在 {contrast1_root} 下未找到任何分类子文件夹")
+                print(f"Warning: no class subfolders found under {contrast1_root}")
             else:
-                print(f"发现分类文件夹：{class_folders}")
+                print(f"Discovered class folders: {class_folders}")
             
             for class_folder in class_folders:
                 c1_class_path = os.path.join(contrast1_root, class_folder)
                 c2_class_path = os.path.join(contrast2_root, class_folder)
                 
                 if not os.path.exists(c2_class_path):
-                    print(f"警告：tranB下缺失分类文件夹 {class_folder}，跳过")
+                    print(f"Warning: class folder {class_folder} missing under tranB, skipped")
                     continue
                 
                 c1_images = [f for f in os.listdir(c1_class_path) 
@@ -118,10 +119,10 @@ class CustomFFADataset(Dataset):
                     c2_img_path = os.path.join(c2_class_path, tranB_img_name)
                     
                     if os.path.exists(c2_img_path):
-                        # 修改：保存文件名（不含路径）
+                        # Modified: also store the filename (without path)
                         image_pairs.append((c1_img_path, c2_img_path, img_name))
                     else:
-                        print(f"警告：文件不匹配\n  tranA: {c1_img_path}\n  期望tranB: {c2_img_path}")
+                        print(f"Warning: file mismatch\n  tranA: {c1_img_path}\n  expected tranB: {c2_img_path}")
         
         elif self.phase == "val":
             c1_images = [f for f in os.listdir(contrast1_root) 
@@ -135,21 +136,21 @@ class CustomFFADataset(Dataset):
                 if os.path.exists(c2_img_path):
                     image_pairs.append((c1_img_path, c2_img_path, img_name))
                 else:
-                    print(f"警告：val集文件不匹配：\n  tranA: {c1_img_path}\n  期望tranB: {c2_img_path}")
+                    print(f"Warning: val-set file mismatch:\n  tranA: {c1_img_path}\n  expected tranB: {c2_img_path}")
         
         if len(image_pairs) == 0:
             raise ValueError(
                 f"\n{'='*60}\n"
-                f"错误：{self.phase}集未找到任何匹配的图片对！\n"
+                f"Error: no matched image pairs found for the {self.phase} set!\n"
                 f"{'='*60}\n"
-                f"请检查以下项：\n"
-                f"1. 路径是否正确：\n   tranA: {contrast1_root}\n   tranB: {contrast2_root}\n"
-                f"2. 文件名规则：tranA的'X_Y.png'必须对应tranB的'X_mask_Y.png'\n"
-                f"3. 文件夹结构：tranA和tranB必须有相同的分类子文件夹（train集）\n"
+                f"Please check the following:\n"
+                f"1. Paths are correct:\n   tranA: {contrast1_root}\n   tranB: {contrast2_root}\n"
+                f"2. Naming rule: tranA 'X_Y.png' must correspond to tranB 'X_mask_Y.png'\n"
+                f"3. Folder structure: tranA and tranB must share the same class subfolders (train set)\n"
                 f"{'='*60}"
             )
         
-        print(f"\n成功加载 {self.phase} 集：{len(image_pairs)} 个图片对\n")
+        print(f"\nSuccessfully loaded the {self.phase} set: {len(image_pairs)} image pairs\n")
         return image_pairs
 
     def __len__(self):
@@ -157,9 +158,10 @@ class CustomFFADataset(Dataset):
 
     def _load_or_compute_mask(self, c1_path):
         """
-        VFD-Diff血管掩码M_VSA(论文公式1-4):
-        优先读取磁盘缓存,否则用参数自适应Frangi计算后缓存为PNG
-        返回: [1,H,W] float张量(0/1)
+        VFD-Diff vessel mask M_VSA (paper Eqs. 1-4):
+        read from the disk cache if available; otherwise compute it with the
+        parameter-adaptive Frangi filter and cache it as a PNG
+        Returns: [1,H,W] float tensor (0/1)
         """
         contrast_root = os.path.join(self.root_path, self.contrast1, self.phase)
         rel = os.path.relpath(c1_path, contrast_root)
@@ -178,18 +180,18 @@ class CustomFFADataset(Dataset):
             os.makedirs(os.path.dirname(mask_path), exist_ok=True)
             Image.fromarray((mask[0, 0].numpy() * 255.0).astype(np.uint8)).save(mask_path)
         except OSError as e:
-            print(f'警告:血管掩码缓存写入失败({e}),改为每次直接计算')
+            print(f'Warning: failed to write the vessel-mask cache ({e}); computing directly each time instead')
         return mask[0]  # [1,H,W]
 
     def __getitem__(self, idx):
-        # 修改：现在返回四个值：img1, img2, filename, vessel_mask
+        # Modified: now returns four values: img1, img2, filename, vessel_mask
         c1_path, c2_path, filename = self.image_pairs[idx]
 
         try:
             img1 = Image.open(c1_path).convert('L')
             img2 = Image.open(c2_path).convert('L')
         except Exception as e:
-            raise RuntimeError(f"读取图片失败：{c1_path} 或 {c2_path}，错误信息：{e}")
+            raise RuntimeError(f"Failed to read image: {c1_path} or {c2_path}, error: {e}")
 
         if self.transform:
             img1 = self.transform(img1)
@@ -198,43 +200,43 @@ class CustomFFADataset(Dataset):
         mask = self._load_or_compute_mask(c1_path) if self.compute_mask else torch.zeros_like(img1)
         return img1, img2, filename, mask
 
-#%% 辅助函数：在图片上添加文件名
+#%% Helper: overlay the filename onto an image
 def add_filename_to_image(image_tensor, filename, font_size=20):
     """
-    在图片上方添加文件名
-    :param image_tensor: 输入图像张量 [C, H, W] 或 [B, C, H, W]
-    :param filename: 要添加的文件名
-    :param font_size: 字体大小
-    :return: 添加了文字的图像张量
+    Add the filename above the image
+    :param image_tensor: input image tensor [C, H, W] or [B, C, H, W]
+    :param filename: filename to add
+    :param font_size: font size
+    :return: image tensor with the text drawn on it
     """
-    # 处理批量情况
+    # Handle the batched case
     if len(image_tensor.shape) == 4:
         result = []
         for i in range(image_tensor.shape[0]):
             result.append(add_filename_to_image(image_tensor[i], filename[i] if isinstance(filename, list) else filename, font_size))
         return torch.stack(result)
     
-    # 单张图片处理
-    # 将张量转换为PIL图像
+    # Single-image processing
+    # Convert the tensor to a PIL image
     img_np = image_tensor.cpu().numpy()
-    img_np = (img_np + 1) / 2.0  # 从[-1,1]转换到[0,1]
+    img_np = (img_np + 1) / 2.0  # convert from [-1,1] to [0,1]
     img_np = np.transpose(img_np, (1, 2, 0))  # [C, H, W] -> [H, W, C]
     
     if img_np.shape[2] == 1:
-        img_np = np.squeeze(img_np, axis=2)  # 单通道
+        img_np = np.squeeze(img_np, axis=2)  # single channel
     
     img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
     
-    # 如果是单通道，转换为RGB以便绘制文字
+    # If single-channel, convert to RGB so text can be drawn
     if img_pil.mode == 'L':
         img_pil = img_pil.convert('RGB')
     
-    # 创建绘图对象
+    # Create a drawing object
     draw = ImageDraw.Draw(img_pil)
     
-    # 尝试加载字体，失败则使用默认字体
+    # Try to load a font; fall back to the default font on failure
     try:
-        # 尝试不同的字体路径
+        # Try different font paths
         font_paths = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
@@ -253,33 +255,33 @@ def add_filename_to_image(image_tensor, filename, font_size=20):
     except:
         font = ImageFont.load_default()
     
-    # 计算文字位置（居中上方）
+    # Compute the text position (centered, at the top)
     text_bbox = draw.textbbox((0, 0), filename, font=font)
     text_width = text_bbox[2] - text_bbox[0]
     text_height = text_bbox[3] - text_bbox[1]
     
-    # 在图片上方添加白色背景条
+    # Add a white bar above the image
     new_height = img_pil.height + text_height + 10
     new_img = Image.new('RGB', (img_pil.width, new_height), color='white')
     new_img.paste(img_pil, (0, text_height + 10))
     
-    # 在白色背景上绘制文字
+    # Draw the text on the white bar
     draw = ImageDraw.Draw(new_img)
     text_x = (img_pil.width - text_width) // 2
     text_y = 5
     draw.text((text_x, text_y), filename, fill='black', font=font)
     
-    # 转换回张量
+    # Convert back to a tensor
     new_img_np = np.array(new_img).astype(np.float32) / 255.0
     new_img_np = np.transpose(new_img_np, (2, 0, 1))  # [H, W, C] -> [C, H, W]
     
-    # 如果输入是单通道，保持单通道输出
+    # If the input is single-channel, keep the output single-channel
     if image_tensor.shape[0] == 1:
-        new_img_np = new_img_np[[0], :, :]  # 只取第一个通道
+        new_img_np = new_img_np[[0], :, :]  # keep only the first channel
     
-    return torch.from_numpy(new_img_np) * 2.0 - 1.0  # 转换回[-1,1]
+    return torch.from_numpy(new_img_np) * 2.0 - 1.0  # convert back to [-1,1]
 
-#%% 扩散系数相关函数（保持不变）
+#%% Diffusion-coefficient helpers (unchanged)
 def var_func_vp(t, beta_min, beta_max):
     log_mean_coeff = -0.25 * t ** 2 * (beta_max - beta_min) - 0.5 * t * beta_min
     var = 1. - torch.exp(2. * log_mean_coeff)
@@ -348,9 +350,9 @@ def q_sample(coeff, x_start, t, *, noise=None):
 
 def q_sample_pairs(coeff, x_start, t, noise_fn=None):
     """
-    前向加噪得到相邻两个时间步的样本对。
-    noise_fn 不为 None 时启用 VFD-Diff FDE(论文公式7):
-    常规高斯噪声 n 替换为高频增强噪声 n̄ = n + λ·HP(n)
+    Forward noising to obtain sample pairs at two adjacent timesteps.
+    When noise_fn is not None, VFD-Diff FDE is enabled (paper Eq. 7):
+    the standard Gaussian noise n is replaced by high-frequency-enhanced noise.
     """
     if noise_fn is not None:
         noise = noise_fn(x_start)
@@ -363,7 +365,7 @@ def q_sample_pairs(coeff, x_start, t, noise_fn=None):
                    extract(coeff.sigmas, t+1, x_start.shape) * noise_tp1
     return x_t, x_t_plus_one
 
-#%% 后验采样相关（保持不变）
+#%% Posterior sampling (unchanged)
 class Posterior_Coefficients():
     def __init__(self, args, device):
         _, _, self.betas = get_sigma_schedule(args, device=device)
@@ -402,8 +404,8 @@ def sample_posterior(coefficients, x_0, x_t, t):
     return sample_x_pos
 
 def sample_from_model(coefficients, generator, n_time, x_init, T, opt, post_fn=None):
-    """反向扩散采样。post_fn 不为 None 时对最终输出做生成端后处理
-    (VFD-Diff FDE 公式8: 傅里叶低频抑制)"""
+    """Reverse-diffusion sampling. When post_fn is not None, the final output is
+    post-processed on the generation side (VFD-Diff FDE Eq. 8: Fourier low-frequency suppression)"""
     x = x_init[:,[0],:]
     source = x_init[:,[1],:]
     with torch.no_grad():
@@ -418,7 +420,7 @@ def sample_from_model(coefficients, generator, n_time, x_init, T, opt, post_fn=N
         x = post_fn(x)
     return x
 
-#%% 学习率调度: 基线cosine / 论文§3.3(前半恒定+后半线性衰减到0)
+#%% LR schedule: baseline cosine / paper Sec. 3.3 (constant first half + linear decay to 0 in the second half)
 def make_lr_scheduler(optimizer, args):
     if args.lr_schedule == 'paper':
         half = max(1, args.num_epoch // 2)
@@ -428,14 +430,16 @@ def make_lr_scheduler(optimizer, args):
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.num_epoch, eta_min=1e-5)
 
-#%% VFD-Diff 教师阶段训练(论文§2.3)
+#%% VFD-Diff teacher-stage training (paper Sec. 2.3)
 def train_teacher_stage(args, device, data_loader_train, data_loader_val,
                         use_vmg, noise_fn, lf_suppress, to_range_0_1):
     """
-    教师网络与学生 gen_diffusive_2 同构(NCSNpp,生成tranB),仅输入不同:
-    条件图为血管掩码加权图(论文: teacher takes vessel-mask-weighted local regions)。
-    镜像基线 CFP→FFA 方向管线(扩散生成器+双向直接生成器+2判别器)独立训练,
-    结束后保存 teacher_vfd.pth 供学生阶段冻结蒸馏。
+    The teacher network shares the architecture of the student gen_diffusive_2
+    (NCSNpp, generates tranB) and differs only in its input: the condition image
+    is the vessel-mask-weighted image (paper: the teacher takes vessel-mask-weighted
+    local regions). It independently trains a mirrored baseline CFP->FFA pipeline
+    (diffusion generator + bidirectional direct generators + 2 discriminators),
+    and saves teacher_vfd.pth at the end for frozen distillation in the student stage.
     """
     from backbones.discriminator import Discriminator_large
     from backbones.ncsnpp_generator_adagn import NCSNpp
@@ -445,25 +449,26 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
     nz = args.nz
     batch_size = args.batch_size
     accumulation_steps = args.accumulation_steps
-    # 教师输入加权: DG要求"血管掩码区域送入教师网络",掩码可得即加权
+    # Teacher input weighting: DG requires the vessel-mask region to be fed to the
+    # teacher network; weight it whenever the mask is available
     weight_input = use_vmg or (not args.no_dg)
 
     exp_path = os.path.join(args.output_path, args.exp)
     if not os.path.exists(exp_path):
         os.makedirs(exp_path)
 
-    print("[VFD-Diff 教师阶段] Initializing diffusion coefficients...")
+    print("[VFD-Diff teacher stage] Initializing diffusion coefficients...")
     coeff = Diffusion_Coefficients(args, device)
     pos_coeff = Posterior_Coefficients(args, device)
     T = get_time_schedule(args, device)
 
-    # 网络组建(镜像基线 tranA→tranB 方向管线)
-    t_gen_diff = NCSNpp(args).to(device)                 # 教师: 扩散生成器(生成tranB)
+    # Build the networks (mirrored baseline tranA->tranB pipeline)
+    t_gen_diff = NCSNpp(args).to(device)                 # teacher: diffusion generator (generates tranB)
     args.num_channels = 1
     t_gen_direct_f = backbones.generator_resnet.define_G(
-        netG='resnet_6blocks', gpu_ids=[args.gpu_chose])  # tranA→tranB 直接生成器
+        netG='resnet_6blocks', gpu_ids=[args.gpu_chose])  # tranA->tranB direct generator
     t_gen_direct_r = backbones.generator_resnet.define_G(
-        netG='resnet_6blocks', gpu_ids=[args.gpu_chose])  # tranB→tranA 直接生成器(cycle用)
+        netG='resnet_6blocks', gpu_ids=[args.gpu_chose])  # tranB->tranA direct generator (for the cycle)
     t_disc_diff = Discriminator_large(
         nc=2, ngf=args.ngf, t_emb_dim=args.t_emb_dim, act=nn.LeakyReLU(0.2)).to(device)
     t_disc_cycle = backbones.generator_resnet.define_D(gpu_ids=[args.gpu_chose])
@@ -505,23 +510,23 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
         sch_t_dd.load_state_dict(ckpt['sch_t_dd'])
         sch_t_dc.load_state_dict(ckpt['sch_t_dc'])
         global_step = ckpt['global_step']
-        print(f"=> [教师阶段] loaded checkpoint (epoch {ckpt['epoch']})")
+        print(f"=> [teacher stage] loaded checkpoint (epoch {ckpt['epoch']})")
 
     for epoch in range(init_epoch, args.num_epoch + 1):
         t_gen_diff.train(); t_gen_direct_f.train(); t_gen_direct_r.train()
         t_disc_diff.train(); t_disc_cycle.train()
 
         for iteration, (x1, x2, filenames, vessel_mask) in enumerate(data_loader_train):
-            real1 = x1.to(device, non_blocking=True)   # tranA(CFP)
-            real2 = x2.to(device, non_blocking=True)   # tranB(FFA)
+            real1 = x1.to(device, non_blocking=True)   # tranA (CFP)
+            real2 = x2.to(device, non_blocking=True)   # tranB (FFA)
             vessel_mask = vessel_mask.to(device, non_blocking=True)
-            # 教师输入: 血管掩码加权CFP(论文: vessel-mask-weighted local regions)
+            # Teacher input: vessel-mask-weighted CFP (paper: vessel-mask-weighted local regions)
             if weight_input:
                 w1 = mask_weighted_source(real1, vessel_mask, args.vfd_teacher_gamma)
             else:
                 w1 = real1
 
-            # ================= 判别器步 =================
+            # ================= Discriminator step =================
             for p in t_disc_diff.parameters():
                 p.requires_grad = True
             for p in t_disc_cycle.parameters():
@@ -531,12 +536,13 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
                 t_disc_cycle.zero_grad()
 
             t2 = torch.randint(0, args.num_timesteps, (real2.size(0),), device=device)
-            # FDE(公式7): 教师阶段同样使用高频增强噪声(与学生一致的前向过程)
+            # FDE (Eq. 7): the teacher stage also uses high-frequency-enhanced noise
+            # (forward process consistent with the student)
             x2_t, x2_tp1 = q_sample_pairs(coeff, real2, t2, noise_fn=noise_fn)
             x2_t.requires_grad = True
 
             z2 = torch.randn(batch_size, nz, device=device)
-            cond_r = t_gen_direct_r(real2)  # 由真实FFA预测的CFP作为条件(镜像基线)
+            cond_r = t_gen_direct_r(real2)  # CFP predicted from real FFA used as the condition (mirrored baseline)
             if weight_input:
                 cond_r = mask_weighted_source(cond_r, vessel_mask, args.vfd_teacher_gamma)
             t_x2_0 = t_gen_diff(torch.cat((x2_tp1.detach(), cond_r), axis=1), t2, z2)
@@ -574,7 +580,7 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
             for p in t_disc_cycle.parameters():
                 p.requires_grad = False
 
-            # ================= 生成器步 =================
+            # ================= Generator step =================
             if iteration % accumulation_steps == 0:
                 t_gen_diff.zero_grad()
                 t_gen_direct_f.zero_grad()
@@ -586,7 +592,7 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
 
             x1_fake = t_gen_direct_r(real2)
             x2_fake = t_gen_direct_f(w1)
-            x2_rec = t_gen_direct_r(x2_fake)  # cycle: 加权CFP→假FFA→重建CFP
+            x2_rec = t_gen_direct_r(x2_fake)  # cycle: weighted CFP -> fake FFA -> reconstructed CFP
 
             cond = x1_fake
             if weight_input:
@@ -597,7 +603,7 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
             errG_adv = F.softplus(-t_disc_diff(x2_pos, t2, x2_tp1.detach()).view(-1).mean()) / accumulation_steps
             errG_cycle_adv = F.softplus(-t_disc_cycle(x2_fake).view(-1).mean()) / accumulation_steps
             errG_cycle = F.l1_loss(x2_rec, real1) / accumulation_steps
-            # VMG(公式5/6): 血管掩码加权L1与SSIM
+            # VMG (Eqs. 5/6): vessel-mask-weighted L1 and SSIM
             if use_vmg:
                 errG_l1 = masked_l1_loss(t_x2_0[:, [0], :], real2, vessel_mask, args.vfd_lam_l1) / accumulation_steps
                 errG_ssim = masked_ssim_loss(t_x2_0[:, [0], :], real2, vessel_mask, args.vfd_lam_ssim) / accumulation_steps
@@ -661,7 +667,7 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
                 'sch_t_dc': sch_t_dc.state_dict(),
             }, teacher_content_file)
 
-        # 保存教师权重(EMA交换后),供学生阶段加载
+        # Save the teacher weights (after the EMA swap) for the student stage to load
         if epoch % args.save_ckpt_every == 0 or epoch == args.num_epoch:
             if args.use_ema:
                 opt_t_diff.swap_parameters_with_ema(store_params_in_ema=True)
@@ -679,7 +685,7 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
                 opt_t_dr.swap_parameters_with_ema(store_params_in_ema=True)
             print(f'[teacher] Saved teacher_vfd.pth at epoch {epoch}')
 
-        # 教师管线验证: tranA→tranB(经公式8低频抑制)
+        # Teacher-pipeline validation: tranA->tranB (with Eq. 8 low-frequency suppression)
         with torch.no_grad():
             psnr_vals = []
             for (a_val, b_val, _, m_val) in data_loader_val:
@@ -698,11 +704,11 @@ def train_teacher_stage(args, device, data_loader_train, data_loader_val,
                     p = psnr(real01, fake, data_range=data_range)
                     psnr_vals.append(0 if np.isnan(p) else p)
             if psnr_vals:
-                print(f'[teacher] Epoch {epoch} Val PSNR (tranA→tranB): {np.mean(psnr_vals):.2f} dB')
+                print(f'[teacher] Epoch {epoch} Val PSNR (tranA->tranB): {np.mean(psnr_vals):.2f} dB')
 
-    print("[VFD-Diff 教师阶段] 训练完成,教师权重已保存至 teacher_vfd.pth")
+    print("[VFD-Diff teacher stage] Training finished; teacher weights saved to teacher_vfd.pth")
 
-#%% 核心训练函数（修改：保存图片时添加文件名）
+#%% Core training function (modified: add filenames when saving images)
 def train_vfd_diff(args):
     from backbones.discriminator import Discriminator_small, Discriminator_large
     from backbones.ncsnpp_generator_adagn import NCSNpp
@@ -713,12 +719,12 @@ def train_vfd_diff(args):
     torch.cuda.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     
-    print(f'===== GPU配置信息 =====')
-    print(f'CUDA可用: {torch.cuda.is_available()}')
-    print(f'当前使用GPU编号: {args.gpu_chose}')
+    print(f'===== GPU configuration =====')
+    print(f'CUDA available: {torch.cuda.is_available()}')
+    print(f'Using GPU index: {args.gpu_chose}')
     if torch.cuda.is_available():
-        print(f'GPU名称: {torch.cuda.get_device_name(args.gpu_chose)}')
-        print(f'GPU显存: {torch.cuda.get_device_properties(args.gpu_chose).total_memory / 1e9:.2f} GB')
+        print(f'GPU name: {torch.cuda.get_device_name(args.gpu_chose)}')
+        print(f'GPU memory: {torch.cuda.get_device_properties(args.gpu_chose).total_memory / 1e9:.2f} GB')
     print(f'======================')
     
     device = torch.device(f'cuda:{args.gpu_chose}' if torch.cuda.is_available() else 'cpu')
@@ -728,23 +734,23 @@ def train_vfd_diff(args):
     nz = args.nz
 
     accumulation_steps = args.accumulation_steps
-    print(f"梯度累积步数: {accumulation_steps}")
+    print(f"Gradient accumulation steps: {accumulation_steps}")
 
     # ----------------------
-    # VFD-Diff 配置(论文三个创新点的开关)
+    # VFD-Diff configuration (toggles for the three contributions in the paper)
     # ----------------------
-    use_vmg = not args.no_vmg   # 血管掩码引导局部增强(公式1-6)
-    use_fde = not args.no_fde   # 双阶段频域增强(公式7-8)
-    use_dg = (not args.no_dg) and (args.vfd_stage == 'student')  # 教师-学生蒸馏(公式9)
+    use_vmg = not args.no_vmg   # vessel-mask-guided local enhancement (Eqs. 1-6)
+    use_fde = not args.no_fde   # two-stage frequency-domain enhancement (Eqs. 7-8)
+    use_dg = (not args.no_dg) and (args.vfd_stage == 'student')  # teacher-student distillation (Eq. 9)
     mask_needed = use_vmg or use_dg
-    # FDE公式(7): 前向高频增强噪声
+    # FDE Eq. (7): forward high-frequency-enhanced noise
     noise_fn = (lambda x: hf_enhanced_noise_like(x, args.vfd_hf_lam, args.vfd_hf_k)) if use_fde else None
-    # FDE公式(8): 生成端傅里叶低频抑制
+    # FDE Eq. (8): generation-side Fourier low-frequency suppression
     lf_suppress = (lambda x: fourier_low_freq_suppress(x, args.vfd_beta_d, args.vfd_cutoff)) if use_fde else None
     print(f'VFD-Diff: stage={args.vfd_stage} | VMG={use_vmg} | FDE={use_fde} | DG={use_dg}')
 
     # ----------------------
-    # 数据加载：使用修改后的数据集（返回文件名 + 血管掩码）
+    # Data loading: use the modified dataset (returns filenames + vessel masks)
     # ----------------------
     dataset_train = CustomFFADataset(
         root_path=args.input_path,
@@ -790,8 +796,9 @@ def train_vfd_diff(args):
     to_range_0_1 = lambda x: (x + 1.) / 2.
 
     # ----------------------
-    # VFD-Diff 教师阶段(论文§2.3):教师网络以血管掩码加权图为条件,
-    # 镜像 CFP→FFA 方向管线独立训练至收敛后保存权重,供学生阶段蒸馏
+    # VFD-Diff teacher stage (paper Sec. 2.3): the teacher network is conditioned
+    # on the vessel-mask-weighted image; a mirrored CFP->FFA pipeline trains
+    # independently to convergence and saves weights for student-stage distillation
     # ----------------------
     if args.vfd_stage == 'teacher':
         train_teacher_stage(args, device, data_loader_train, data_loader_val,
@@ -800,8 +807,9 @@ def train_vfd_diff(args):
 
     gen_diffusive_1 = NCSNpp(args).to(device)
     gen_diffusive_2 = NCSNpp(args).to(device)
-    # VFD-Diff DG: 冻结的教师扩散生成器(与学生 gen_diffusive_2 同构,
-    # 以血管掩码加权图为条件,见 teacher 阶段训练)
+    # VFD-Diff DG: frozen teacher diffusion generator (same architecture as the
+    # student gen_diffusive_2, conditioned on the vessel-mask-weighted image;
+    # see the teacher-stage training)
     teacher_gen_diff = NCSNpp(args).to(device) if use_dg else None
     args.num_channels = 1
     gen_non_diffusive_1to2 = backbones.generator_resnet.define_G(netG='resnet_6blocks', gpu_ids=[args.gpu_chose])
@@ -830,7 +838,7 @@ def train_vfd_diff(args):
         optimizer_gen_non_diffusive_1to2 = EMA(optimizer_gen_non_diffusive_1to2, ema_decay=args.ema_decay)
         optimizer_gen_non_diffusive_2to1 = EMA(optimizer_gen_non_diffusive_2to1, ema_decay=args.ema_decay)
 
-    # 学习率调度: cosine(基线) 或 paper(论文§3.3: 前半恒定+后半线性衰减到0)
+    # LR schedule: cosine (baseline) or paper (Sec. 3.3: constant first half + linear decay to 0 in the second half)
     scheduler_gen_diffusive_1 = make_lr_scheduler(optimizer_gen_diffusive_1, args)
     scheduler_gen_diffusive_2 = make_lr_scheduler(optimizer_gen_diffusive_2, args)
     scheduler_gen_non_diffusive_1to2 = make_lr_scheduler(optimizer_gen_non_diffusive_1to2, args)
@@ -856,20 +864,20 @@ def train_vfd_diff(args):
     T = get_time_schedule(args, device)
     print("Diffusion coefficients initialized successfully!")
 
-    # VFD-Diff DG(论文§2.3): 加载教师阶段训练好的教师网络并冻结
+    # VFD-Diff DG (paper Sec. 2.3): load the teacher trained in the teacher stage and freeze it
     if use_dg:
         teacher_ckpt = os.path.join(exp_path, 'teacher_vfd.pth')
         if not os.path.exists(teacher_ckpt):
             raise FileNotFoundError(
-                f"未找到教师权重 {teacher_ckpt}。\n"
-                f"请先运行教师阶段: python train.py --vfd_stage teacher ... (其余参数保持一致)"
+                f"Teacher weights not found at {teacher_ckpt}.\n"
+                f"Please run the teacher stage first: python train.py --vfd_stage teacher ... (keep the other arguments identical)"
             )
         tstate = torch.load(teacher_ckpt, map_location=device)
         teacher_gen_diff.load_state_dict(tstate['teacher_gen_diff'])
         teacher_gen_diff.eval()
         for p in teacher_gen_diff.parameters():
             p.requires_grad = False
-        print(f"=> VFD-Diff: 已加载并冻结教师网络 (teacher epoch {tstate.get('epoch', '?')})")
+        print(f"=> VFD-Diff: loaded and froze the teacher network (teacher epoch {tstate.get('epoch', '?')})")
 
     global_step, epoch, init_epoch = 0, 0, 0
     if args.resume:
@@ -904,7 +912,7 @@ def train_vfd_diff(args):
             scheduler_disc_non_diffusive_cycle2.load_state_dict(checkpoint['scheduler_disc_non_diffusive_cycle2'])
             global_step = checkpoint['global_step']
             print(f"=> loaded checkpoint (epoch {checkpoint['epoch']})")
-            # VFD-Diff: 恢复冻结教师权重
+            # VFD-Diff: restore the frozen teacher weights
             if use_dg and checkpoint.get('teacher_gen_diff_dict') is not None:
                 teacher_gen_diff.load_state_dict(checkpoint['teacher_gen_diff_dict'])
                 teacher_gen_diff.eval()
@@ -920,7 +928,7 @@ def train_vfd_diff(args):
         disc_non_diffusive_cycle1.train()
         disc_non_diffusive_cycle2.train()
 
-        # 修改：现在数据加载器返回四个值（含VFD-Diff血管掩码）
+        # Modified: the data loader now returns four values (including the VFD-Diff vessel mask)
         for iteration, (x1, x2, filenames, vessel_mask) in enumerate(data_loader_train):
             vessel_mask = vessel_mask.to(device, non_blocking=True)
             for p in disc_diffusive_1.parameters():
@@ -945,7 +953,7 @@ def train_vfd_diff(args):
             t2 = torch.randint(0, args.num_timesteps, (real_data2.size(0),), device=device)
             x1_t, x1_tp1 = q_sample_pairs(coeff, real_data1, t1)
             x1_t.requires_grad = True
-            # VFD-Diff FDE(公式7): 目标方向 tranA→tranB 的前向加噪使用高频增强噪声
+            # VFD-Diff FDE (Eq. 7): forward noising in the target tranA->tranB direction uses high-frequency-enhanced noise
             x2_t, x2_tp1 = q_sample_pairs(coeff, real_data2, t2, noise_fn=noise_fn)
             x2_t.requires_grad = True
 
@@ -1035,7 +1043,7 @@ def train_vfd_diff(args):
             t1 = torch.randint(0, args.num_timesteps, (real_data1.size(0),), device=device)
             t2 = torch.randint(0, args.num_timesteps, (real_data2.size(0),), device=device)
             x1_t, x1_tp1 = q_sample_pairs(coeff, real_data1, t1)
-            # VFD-Diff FDE(公式7): 目标方向前向加噪使用高频增强噪声
+            # VFD-Diff FDE (Eq. 7): forward noising in the target direction uses high-frequency-enhanced noise
             x2_t, x2_tp1 = q_sample_pairs(coeff, real_data2, t2, noise_fn=noise_fn)
             latent_z1 = torch.randn(batch_size, nz, device=device)
             latent_z2 = torch.randn(batch_size, nz, device=device)
@@ -1045,8 +1053,9 @@ def train_vfd_diff(args):
             x2_0_predict = gen_non_diffusive_1to2(real_data1)
             x1_0_predict_cycle = gen_non_diffusive_2to1(x2_0_predict)
 
-            # VFD-Diff DG(论文§2.3): 冻结教师以血管掩码加权条件图前向,
-            # 与学生共享同一 (x2_tp1, t2, latent_z2),先于学生前向以降低峰值显存
+            # VFD-Diff DG (paper Sec. 2.3): the frozen teacher forwards with the
+            # vessel-mask-weighted condition, sharing (x2_tp1, t2, latent_z2)
+            # with the student; it runs before the student forward to reduce peak memory
             teacher_x2_0, teacher_feats = None, None
             if use_dg:
                 with torch.no_grad():
@@ -1080,7 +1089,7 @@ def train_vfd_diff(args):
             errG_cycle_adv = (errG_cycle_adv1 + errG_cycle_adv2) / accumulation_steps
 
             errG1_L1 = F.l1_loss(x1_0_predict_diff[:, [0], :], real_data1)
-            # VFD-Diff VMG(公式5): 目标方向(tranA→tranB)的L1替换为血管掩码加权L1
+            # VFD-Diff VMG (Eq. 5): replace the L1 in the target direction (tranA->tranB) with vessel-mask-weighted L1
             if use_vmg:
                 errG2_L1 = masked_l1_loss(x2_0_predict_diff[:, [0], :], real_data2,
                                           vessel_mask, args.vfd_lam_l1)
@@ -1088,13 +1097,14 @@ def train_vfd_diff(args):
                 errG2_L1 = F.l1_loss(x2_0_predict_diff[:, [0], :], real_data2)
             errG_L1 = (errG1_L1 + errG2_L1) / accumulation_steps
 
-            # VFD-Diff VMG(公式6): 血管掩码加权SSIM损失
+            # VFD-Diff VMG (Eq. 6): vessel-mask-weighted SSIM loss
             errG2_SSIM = torch.tensor(0.0, device=device)
             if use_vmg:
                 errG2_SSIM = masked_ssim_loss(x2_0_predict_diff[:, [0], :], real_data2,
                                               vessel_mask, args.vfd_lam_ssim) / accumulation_steps
 
-            # VFD-Diff DG: 像素级蒸馏(公式5复用,学生x0对齐教师x0) + 特征级蒸馏(公式9)
+            # VFD-Diff DG: pixel-level distillation (reuses Eq. 5, aligning the student x0 to the teacher x0)
+            # + feature-level distillation (Eq. 9)
             distill_pix = torch.tensor(0.0, device=device)
             distill_feat = torch.tensor(0.0, device=device)
             if use_dg:
@@ -1158,15 +1168,15 @@ def train_vfd_diff(args):
 
         with torch.no_grad():
             # ----------------------
-            # 修改：生成sample2_discrete_epoch图片并添加文件名
+            # Modified: generate the sample2_discrete_epoch image with filenames added
             # ----------------------
-            # 保存原始的sample1_discrete（不变）
+            # Save the original sample1_discrete (unchanged)
             x1_t = torch.cat((torch.randn_like(real_data1), real_data2), axis=1)
             fake_sample1 = sample_from_model(pos_coeff, gen_diffusive_1, args.num_timesteps, x1_t, T, args)
             fake_sample1 = torch.cat((real_data2, fake_sample1), axis=-1)
             torchvision.utils.save_image(fake_sample1, os.path.join(exp_path, f'sample1_discrete_epoch_{epoch}.png'), normalize=True)
 
-            # 保存原始的sample1_translated（不变）
+            # Save the original sample1_translated (unchanged)
             pred1 = gen_non_diffusive_2to1(real_data2)
             x2_t = torch.cat((torch.randn_like(real_data2), pred1), axis=1)
             fake_sample2_tilda = gen_diffusive_2(x2_t, t2, latent_z2)
@@ -1174,15 +1184,15 @@ def train_vfd_diff(args):
             torchvision.utils.save_image(pred1, os.path.join(exp_path, f'sample1_translated_epoch_{epoch}.png'), normalize=True)
 
             # ----------------------
-            # 核心修改：sample2_discrete_epoch - 添加文件名
+            # Core modification: sample2_discrete_epoch - add filenames
             # ----------------------
             x2_t = torch.cat((torch.randn_like(real_data2), real_data1), axis=1)
             fake_sample2 = sample_from_model(pos_coeff, gen_diffusive_2, args.num_timesteps, x2_t, T, args)
             
-            # 拼接：real_data1 (tranA) + fake_sample2 (生成的tranB) + real_data2 (真实tranB)
+            # Concatenate: real_data1 (tranA) + fake_sample2 (generated tranB) + real_data2 (real tranB)
             concatenated = torch.cat((real_data1, fake_sample2, real_data2), axis=-1)
             
-            # 为每张图片添加文件名
+            # Add the filename to each image
             images_with_filenames = []
             for i in range(concatenated.shape[0]):
                 img_with_name = add_filename_to_image(concatenated[i], filenames[i])
@@ -1190,15 +1200,15 @@ def train_vfd_diff(args):
             
             images_with_filenames = torch.stack(images_with_filenames)
             
-            # 保存添加了文件名的图片
+            # Save the images with filenames added
             torchvision.utils.save_image(
                 images_with_filenames, 
                 os.path.join(exp_path, f'sample2_discrete_epoch_{epoch}.png'), 
                 normalize=True,
-                nrow=1  # 每行一张图片，确保文件名清晰可见
+                nrow=1  # one image per row so the filenames stay clearly visible
             )
 
-            # 保存原始的sample2_translated（不变）
+            # Save the original sample2_translated (unchanged)
             pred2 = gen_non_diffusive_1to2(real_data1)
             x1_t = torch.cat((torch.randn_like(real_data1), pred2), axis=1)
             fake_sample1_tilda = gen_diffusive_1(x1_t, t1, latent_z1)
@@ -1240,7 +1250,7 @@ def train_vfd_diff(args):
                     'disc_non_diffusive_cycle2_dict': disc_non_diffusive_cycle2.state_dict(),
                     'optimizer_disc_non_diffusive_cycle2': optimizer_disc_non_diffusive_cycle2.state_dict(),
                     'scheduler_disc_non_diffusive_cycle2': scheduler_disc_non_diffusive_cycle2.state_dict(),
-                    # VFD-Diff: 冻结教师状态(便于学生阶段断点续训)
+                    # VFD-Diff: frozen teacher state (for resuming the student stage)
                     'teacher_gen_diff_dict': teacher_gen_diff.state_dict() if use_dg else None,
                 }
                 torch.save(content, os.path.join(exp_path, 'content.pth'))
@@ -1263,7 +1273,7 @@ def train_vfd_diff(args):
             print(f'Saved checkpoint at epoch {epoch}')
 
         with torch.no_grad():
-            # 方向1验证: tranB→tranA(gen_diffusive_1)
+            # Direction-1 validation: tranB->tranA (gen_diffusive_1)
             for iteration, (a_val, b_val, _, _) in enumerate(data_loader_val):
                 real_data = a_val.to(device, non_blocking=True)
                 source_data = b_val.to(device, non_blocking=True)
@@ -1281,12 +1291,14 @@ def train_vfd_diff(args):
                 psnr_val = psnr(real_data, fake_sample1, data_range=data_range) if data_range > 0 else 0
                 val_psnr_values[0, epoch, iteration] = psnr_val if not np.isnan(psnr_val) else 0
 
-            # 方向2验证: tranA→tranB(gen_diffusive_2,目标方向)
-            # 修正: 原基线代码此循环误用 gen_diffusive_1,现与 test.py 口径一致;
-            # VFD-Diff FDE(公式8): 生成图先经傅里叶低频抑制再计算指标
+            # Direction-2 validation: tranA->tranB (gen_diffusive_2, target direction)
+            # Fix: the original baseline loop mistakenly used gen_diffusive_1 here;
+            # it now matches test.py
+            # VFD-Diff FDE (Eq. 8): generated images go through Fourier low-frequency
+            # suppression before computing metrics
             for iteration, (a_val, b_val, _, _) in enumerate(data_loader_val):
-                source_data = a_val.to(device, non_blocking=True)   # tranA 源
-                real_data = b_val.to(device, non_blocking=True)     # tranB 目标
+                source_data = a_val.to(device, non_blocking=True)   # tranA source
+                real_data = b_val.to(device, non_blocking=True)     # tranB target
                 x2_t = torch.cat((torch.randn_like(real_data), source_data), axis=1)
                 fake_sample2 = sample_from_model(pos_coeff, gen_diffusive_2, args.num_timesteps,
                                                  x2_t, T, args, post_fn=lf_suppress)
@@ -1306,13 +1318,13 @@ def train_vfd_diff(args):
         mean_psnr_2 = np.nanmean(val_psnr_values[1, epoch, :])
         mean_l1_1 = np.nanmean(val_l1_loss[0, epoch, :])
         mean_l1_2 = np.nanmean(val_l1_loss[1, epoch, :])
-        print(f'Epoch {epoch} Val PSNR (tranB→tranA): {mean_psnr_1:.2f} dB | L1: {mean_l1_1:.4f}')
-        print(f'Epoch {epoch} Val PSNR (tranA→tranB,目标方向): {mean_psnr_2:.2f} dB | L1: {mean_l1_2:.4f}')
+        print(f'Epoch {epoch} Val PSNR (tranB->tranA): {mean_psnr_1:.2f} dB | L1: {mean_l1_1:.4f}')
+        print(f'Epoch {epoch} Val PSNR (tranA->tranB, target direction): {mean_psnr_2:.2f} dB | L1: {mean_l1_2:.4f}')
 
         np.save(os.path.join(exp_path, 'val_l1_loss.npy'), val_l1_loss)
         np.save(os.path.join(exp_path, 'val_psnr_values.npy'), val_psnr_values)
 
-#%% 主函数（保持不变）
+#%% Main entry (unchanged)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('VFD-Diff parameters')
     parser.add_argument('--seed', type=int, default=1024, help='seed used for initialization')
@@ -1320,86 +1332,86 @@ if __name__ == '__main__':
     parser.add_argument('--image_size', type=int, default=512, help='size of image')
     parser.add_argument('--num_channels', type=int, default=3, help='channel of image')
     parser.add_argument('--centered', action='store_false', default=True, help='-1,1 scale')
-    parser.add_argument('--use_geometric', action='store_true', default=False, help='几何噪声调度')
+    parser.add_argument('--use_geometric', action='store_true', default=False, help='geometric noise schedule')
     parser.add_argument('--beta_min', type=float, default=0.1, help='diffusion beta_min')
     parser.add_argument('--beta_max', type=float, default=20., help='diffusion beta_max')
 
-    parser.add_argument('--num_channels_dae', type=int, default=128, help='denosing model初始通道数')
-    parser.add_argument('--n_mlp', type=int, default=3, help='z的mlp层数')
-    parser.add_argument('--ch_mult', nargs='+', type=int, required=True, help='通道倍增系数')
-    parser.add_argument('--num_res_blocks', type=int, default=2, help='每个尺度的resnet块数')
-    parser.add_argument('--attn_resolutions', nargs='+', type=int, default=(64, 32, 16), help='注意力机制应用的分辨率')
-    parser.add_argument('--dropout', type=float, default=0., help='dropout率')
-    parser.add_argument('--resamp_with_conv', action='store_false', default=True, help='上/下采样使用卷积')
-    parser.add_argument('--conditional', action='store_false', default=True, help='噪声条件')
-    parser.add_argument('--fir', action='store_false', default=True, help='FIR滤波')
-    parser.add_argument('--fir_kernel', default=[1, 3, 3, 1], help='FIR核')
-    parser.add_argument('--skip_rescale', action='store_false', default=True, help='跳过rescale')
-    parser.add_argument('--resblock_type', default='biggan', help='resnet块类型')
-    parser.add_argument('--progressive', type=str, default='none', choices=['none', 'output_skip', 'residual'], help='输出渐进式类型')
-    parser.add_argument('--progressive_input', type=str, default='residual', choices=['none', 'input_skip', 'residual'], help='输入渐进式类型')
-    parser.add_argument('--progressive_combine', type=str, default='sum', choices=['sum', 'cat'], help='渐进式融合方式')
-    parser.add_argument('--embedding_type', type=str, default='positional', choices=['positional', 'fourier'], help='时间嵌入类型')
-    parser.add_argument('--fourier_scale', type=float, default=16., help='傅里叶变换尺度')
-    parser.add_argument('--not_use_tanh', action='store_true', default=False, help='是否使用tanh')
+    parser.add_argument('--num_channels_dae', type=int, default=128, help='initial number of channels of the denoising model')
+    parser.add_argument('--n_mlp', type=int, default=3, help='number of MLP layers for z')
+    parser.add_argument('--ch_mult', nargs='+', type=int, required=True, help='channel multipliers')
+    parser.add_argument('--num_res_blocks', type=int, default=2, help='number of ResNet blocks per scale')
+    parser.add_argument('--attn_resolutions', nargs='+', type=int, default=(64, 32, 16), help='resolutions at which attention is applied')
+    parser.add_argument('--dropout', type=float, default=0., help='dropout rate')
+    parser.add_argument('--resamp_with_conv', action='store_false', default=True, help='use conv for up/downsampling')
+    parser.add_argument('--conditional', action='store_false', default=True, help='noise conditioning')
+    parser.add_argument('--fir', action='store_false', default=True, help='FIR filtering')
+    parser.add_argument('--fir_kernel', default=[1, 3, 3, 1], help='FIR kernel')
+    parser.add_argument('--skip_rescale', action='store_false', default=True, help='skip rescale')
+    parser.add_argument('--resblock_type', default='biggan', help='ResNet block type')
+    parser.add_argument('--progressive', type=str, default='none', choices=['none', 'output_skip', 'residual'], help='output progression type')
+    parser.add_argument('--progressive_input', type=str, default='residual', choices=['none', 'input_skip', 'residual'], help='input progression type')
+    parser.add_argument('--progressive_combine', type=str, default='sum', choices=['sum', 'cat'], help='progression combination mode')
+    parser.add_argument('--embedding_type', type=str, default='positional', choices=['positional', 'fourier'], help='time embedding type')
+    parser.add_argument('--fourier_scale', type=float, default=16., help='Fourier transform scale')
+    parser.add_argument('--not_use_tanh', action='store_true', default=False, help='whether to use tanh')
 
-    parser.add_argument('--exp', default='exp_ffa_generation', help='实验名称')
-    parser.add_argument('--input_path', required=True, help='输入数据路径')
-    parser.add_argument('--output_path', required=True, help='输出保存路径')
-    parser.add_argument('--nz', type=int, default=100, help='latent维度')
-    parser.add_argument('--num_timesteps', type=int, default=4, help='扩散时间步')
-    parser.add_argument('--z_emb_dim', type=int, default=512, help='z嵌入维度')
-    parser.add_argument('--t_emb_dim', type=int, default=512, help='t嵌入维度')
-    parser.add_argument('--batch_size', type=int, default=1, help='批次大小')
-    parser.add_argument('--num_epoch', type=int, default=1200, help='训练轮次')
-    parser.add_argument('--ngf', type=int, default=64, help='判别器滤波器数量')
-    parser.add_argument('--lr_g', type=float, default=1.5e-4, help='生成器学习率')
-    parser.add_argument('--lr_d', type=float, default=1e-4, help='判别器学习率')
+    parser.add_argument('--exp', default='exp_ffa_generation', help='experiment name')
+    parser.add_argument('--input_path', required=True, help='input data path')
+    parser.add_argument('--output_path', required=True, help='output save path')
+    parser.add_argument('--nz', type=int, default=100, help='latent dimension')
+    parser.add_argument('--num_timesteps', type=int, default=4, help='diffusion timesteps')
+    parser.add_argument('--z_emb_dim', type=int, default=512, help='z embedding dimension')
+    parser.add_argument('--t_emb_dim', type=int, default=512, help='t embedding dimension')
+    parser.add_argument('--batch_size', type=int, default=1, help='batch size')
+    parser.add_argument('--num_epoch', type=int, default=1200, help='number of training epochs')
+    parser.add_argument('--ngf', type=int, default=64, help='number of discriminator filters')
+    parser.add_argument('--lr_g', type=float, default=1.5e-4, help='generator learning rate')
+    parser.add_argument('--lr_d', type=float, default=1e-4, help='discriminator learning rate')
     parser.add_argument('--beta1', type=float, default=0.5, help='adam beta1')
     parser.add_argument('--beta2', type=float, default=0.9, help='adam beta2')
-    parser.add_argument('--no_lr_decay', action='store_true', default=False, help='不衰减学习率')
-    parser.add_argument('--use_ema', action='store_true', default=False, help='使用EMA')
-    parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA衰减率')
-    parser.add_argument('--r1_gamma', type=float, default=0.05, help='R1正则化系数')
-    parser.add_argument('--lazy_reg', type=int, default=None, help='延迟正则化')
-    parser.add_argument('--save_content', action='store_true', default=False, help='保存训练状态')
-    parser.add_argument('--save_content_every', type=int, default=10, help='每x轮保存训练状态')
-    parser.add_argument('--save_ckpt_every', type=int, default=10, help='每x轮保存模型权重')
-    parser.add_argument('--lambda_l1_loss', type=float, default=0.5, help='L1损失权重')
-    parser.add_argument('--accumulation_steps', type=int, default=4, help='梯度累积步数')
+    parser.add_argument('--no_lr_decay', action='store_true', default=False, help='disable learning-rate decay')
+    parser.add_argument('--use_ema', action='store_true', default=False, help='use EMA')
+    parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay rate')
+    parser.add_argument('--r1_gamma', type=float, default=0.05, help='R1 regularization coefficient')
+    parser.add_argument('--lazy_reg', type=int, default=None, help='lazy regularization')
+    parser.add_argument('--save_content', action='store_true', default=False, help='save training state')
+    parser.add_argument('--save_content_every', type=int, default=10, help='save training state every x epochs')
+    parser.add_argument('--save_ckpt_every', type=int, default=10, help='save model weights every x epochs')
+    parser.add_argument('--lambda_l1_loss', type=float, default=0.5, help='L1 loss weight')
+    parser.add_argument('--accumulation_steps', type=int, default=4, help='gradient accumulation steps')
 
-    parser.add_argument('--contrast1', type=str, default='tranA', help='源模态根文件夹')
-    parser.add_argument('--contrast2', type=str, default='tranB', help='目标模态根文件夹')
+    parser.add_argument('--contrast1', type=str, default='tranA', help='source modality root folder')
+    parser.add_argument('--contrast2', type=str, default='tranB', help='target modality root folder')
 
-    parser.add_argument('--gpu_chose', type=int, default=0, help='选择的GPU编号')
+    parser.add_argument('--gpu_chose', type=int, default=0, help='GPU index to use')
 
-    # ---------------- VFD-Diff 参数(论文三个创新点) ----------------
+    # ---------------- VFD-Diff parameters (the three contributions in the paper) ----------------
     parser.add_argument('--vfd_stage', type=str, default='student', choices=['student', 'teacher'],
-                        help='teacher=教师阶段独立训练; student=学生阶段(基线训练+蒸馏,需先完成教师阶段)')
-    # 消融开关(对应论文Table 1/2)
-    parser.add_argument('--no_vmg', action='store_true', default=False, help='关闭VMG(血管掩码引导局部增强)')
-    parser.add_argument('--no_fde', action='store_true', default=False, help='关闭FDE(双阶段频域增强)')
-    parser.add_argument('--no_dg', action='store_true', default=False, help='关闭DG(教师-学生蒸馏)')
-    # VMG(公式5/6): 论文未给出数值,以下为默认设定
-    parser.add_argument('--vfd_lam_l1', type=float, default=5.0, help='公式(5)血管掩码权重λ_L1')
-    parser.add_argument('--vfd_lam_ssim', type=float, default=5.0, help='公式(6)血管掩码权重λ_SSIM')
-    parser.add_argument('--vfd_ssim_weight', type=float, default=1.0, help='加权SSIM项在总损失中的权重')
-    # FDE(公式7/8)
-    parser.add_argument('--vfd_hf_lam', type=float, default=0.5, help='公式(7)高频增强强度λ')
-    parser.add_argument('--vfd_hf_k', type=int, default=5, help='公式(7)高通滤波高斯核尺寸')
-    parser.add_argument('--vfd_beta_d', type=float, default=0.1, help='公式(8)低频衰减系数β_d')
-    parser.add_argument('--vfd_cutoff', type=int, default=32, help='公式(8)低频掩码半径(像素)')
-    # DG(公式9)
-    parser.add_argument('--vfd_alpha', type=float, default=1.0, help='公式(9)余弦相似度项权重α')
-    parser.add_argument('--vfd_beta_mse', type=float, default=1.0, help='公式(9)MSE项权重β')
-    parser.add_argument('--vfd_distill_weight', type=float, default=1.0, help='蒸馏损失(像素+特征)总权重')
-    parser.add_argument('--vfd_teacher_gamma', type=float, default=2.0, help='教师输入血管加权系数γ(w=1+γ·M)')
-    # 自适应Frangi(公式2-4)
-    parser.add_argument('--vfd_frangi_dmax', type=float, default=16.0, help='公式(2)(4)最大血管直径D_max(像素,512基准)')
-    parser.add_argument('--vfd_frangi_dmin', type=float, default=2.0, help='公式(4)最小血管直径D_min(像素,512基准)')
-    # 学习率调度(论文§3.3: 前300轮恒定1.5e-4,后300轮线性衰减到0)
+                        help='teacher=independent teacher-stage training; student=student stage (baseline training + distillation, requires the teacher stage to finish first)')
+    # Ablation switches (corresponding to Tables 1/2 in the paper)
+    parser.add_argument('--no_vmg', action='store_true', default=False, help='disable VMG (vessel-mask-guided local enhancement)')
+    parser.add_argument('--no_fde', action='store_true', default=False, help='disable FDE (two-stage frequency-domain enhancement)')
+    parser.add_argument('--no_dg', action='store_true', default=False, help='disable DG (teacher-student distillation)')
+    # VMG (Eqs. 5/6): the paper gives no values; the following are default settings
+    parser.add_argument('--vfd_lam_l1', type=float, default=5.0, help='vessel-mask weight lambda_L1 in Eq. (5)')
+    parser.add_argument('--vfd_lam_ssim', type=float, default=5.0, help='vessel-mask weight lambda_SSIM in Eq. (6)')
+    parser.add_argument('--vfd_ssim_weight', type=float, default=1.0, help='weight of the weighted-SSIM term in the total loss')
+    # FDE (Eqs. 7/8)
+    parser.add_argument('--vfd_hf_lam', type=float, default=0.5, help='high-frequency enhancement strength lambda in Eq. (7)')
+    parser.add_argument('--vfd_hf_k', type=int, default=5, help='high-pass Gaussian kernel size in Eq. (7)')
+    parser.add_argument('--vfd_beta_d', type=float, default=0.1, help='low-frequency decay coefficient beta_d in Eq. (8)')
+    parser.add_argument('--vfd_cutoff', type=int, default=32, help='low-frequency mask radius in Eq. (8) (pixels)')
+    # DG (Eq. 9)
+    parser.add_argument('--vfd_alpha', type=float, default=1.0, help='cosine-similarity term weight alpha in Eq. (9)')
+    parser.add_argument('--vfd_beta_mse', type=float, default=1.0, help='MSE term weight beta in Eq. (9)')
+    parser.add_argument('--vfd_distill_weight', type=float, default=1.0, help='total weight of the distillation loss (pixel + feature)')
+    parser.add_argument('--vfd_teacher_gamma', type=float, default=2.0, help='vessel weighting coefficient gamma for the teacher input (w = 1 + gamma * M)')
+    # Adaptive Frangi (Eqs. 2-4)
+    parser.add_argument('--vfd_frangi_dmax', type=float, default=16.0, help='max vessel diameter D_max in Eqs. (2)(4) (pixels, 512-based)')
+    parser.add_argument('--vfd_frangi_dmin', type=float, default=2.0, help='min vessel diameter D_min in Eq. (4) (pixels, 512-based)')
+    # LR schedule (paper Sec. 3.3: constant 1.5e-4 for the first 300 epochs, then linear decay to 0 over the last 300)
     parser.add_argument('--lr_schedule', type=str, default='cosine', choices=['cosine', 'paper'],
-                        help="cosine=基线余弦退化; paper=论文协议(前半恒定+后半线性衰减)")
+                        help="cosine=baseline cosine annealing; paper=paper protocol (constant first half + linear decay in the second half)")
 
     args = parser.parse_args()
     train_vfd_diff(args)
